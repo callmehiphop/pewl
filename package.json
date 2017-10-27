@@ -1,0 +1,19 @@
+{
+  "name": "pewl",
+  "version": "0.0.0",
+  "description": "Generic Pooling Library",
+  "main": "index.js",
+  "scripts": {
+    "prettier": "prettier --write *.js lib/*.js",
+    "test": "mocha test.js --no-timeouts --bail"
+  },
+  "author": "Dave Gramlich <callmehiphop@gmail.com>",
+  "license": "ISC",
+  "devDependencies": {
+    "mocha": "^4.0.1",
+    "prettier": "^1.7.4"
+  },
+  "dependencies": {
+    "p-queue": "^2.2.0"
+  }
+}
