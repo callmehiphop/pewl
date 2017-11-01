@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('assert');
+const delay = require('delay');
 const spyny = require('spyny').sandbox();
 
 const spy = spyny.spy;
@@ -22,37 +23,23 @@ describe('Pool', () => {
     destroy: resource => resource.destroy()
   };
 
-  const pool = new Pool(defaultOptions);
+  let pool;
 
-  beforeEach(() => spyny.restore());
-  after(() => pool.close());
+  beforeEach(() => {
+    spyny.restore();
+    pool = new Pool(defaultOptions);
+
+    return pool.open();
+  });
+
+  afterEach(() => pool.close());
 
   describe('instantiating', () => {
-    it('should throw an error if "create" is missing', () => {
-      assert.throws(() => {
-        new Pool();
-      }, /Both \"create\" and \"destroy\" methods are required\./);
-    });
-
-    it('should throw an error if "destroy" is missing', () => {
-      assert.throws(() => {
-        new Pool({ create: defaultOptions.create });
-      }, /Both \"create\" and \"destroy\" methods are required\./);
-    });
-
-    it('should not auto start the pool when specified', () => {
-      const stub = spy.on(Pool.prototype, 'open').passthrough();
-      const options = Object.assign({ autoStart: false }, defaultOptions);
-      const pool = new Pool(options);
-
-      assert.strictEqual(stub.called, false);
-    });
-
     it('should fill the pool to the min value', () => {
       const stub = spy.on(FakeResource.prototype, 'create').passthrough();
       const min = 5;
 
-      const options = Object.assign({ autoStart: false, min }, defaultOptions);
+      const options = Object.assign({ min }, defaultOptions);
       const pool = new Pool(options);
 
       return pool.open().then(() => {
@@ -81,16 +68,22 @@ describe('Pool', () => {
     });
 
     it('should not create resources when there are available ones', () => {
-      const stub = spy.on(FakeResource.prototype, 'create').passthrough();
+      let stub;
 
-      assert.strictEqual(pool.size, 1);
+      return pool
+        .set('min', 1)
+        .fill()
+        .then(() => {
+          assert.strictEqual(pool.size, 1);
+          stub = spy.on(FakeResource.prototype, 'create').passthrough();
+          return pool.acquire();
+        })
+        .then(resource => {
+          assert.strictEqual(stub.called, false);
+          assert.strictEqual(pool.size, 1);
 
-      return pool.acquire().then(resource => {
-        assert.strictEqual(stub.called, false);
-        assert.strictEqual(pool.size, 1);
-
-        pool.release(resource);
-      });
+          pool.release(resource);
+        });
     });
 
     it('should not create a new resource if the max is hit', () => {
@@ -120,9 +113,6 @@ describe('Pool', () => {
     });
 
     it('should release resources back to the pool', () => {
-      assert.strictEqual(pool.available, 1);
-      assert.strictEqual(pool.borrowed, 0);
-
       return pool.acquire().then(resource => {
         assert.strictEqual(pool.available, 0);
         assert.strictEqual(pool.borrowed, 1);
@@ -161,7 +151,6 @@ describe('Pool', () => {
     it('should destroy expired resources', () => {
       const stub = spy.on(FakeResource.prototype, 'destroy').passthrough();
       const options = Object.assign({
-        autoStart: false,
         diesAfter: 1000,
         min: 5,
         skimInterval: 1500
@@ -170,7 +159,7 @@ describe('Pool', () => {
       const pool = new Pool(options);
 
       return pool.open()
-        .then(() => wait(2000))
+        .then(() => delay(2000))
         .then(() => {
           assert.strictEqual(stub.callCount, 5);
           return pool.close();
@@ -180,7 +169,6 @@ describe('Pool', () => {
     it('should respect the maxIdle option', () => {
       const stub = spy.on(FakeResource.prototype, 'destroy').passthrough();
       const options = Object.assign({
-        autoStart: false,
         idlesAfter: 1000,
         maxIdle: 1,
         min: 5,
@@ -192,12 +180,12 @@ describe('Pool', () => {
       return pool.open()
         .then(() => {
           pool.set('min', 0)
-          return wait(1100);
+          return delay(1100);
         })
         .then(() => {
           assert.strictEqual(pool.size, 5);
           assert.strictEqual(pool.idle, 5);
-          return wait(900);
+          return delay(900);
         })
         .then(() => {
           assert.strictEqual(stub.callCount, 4);
@@ -216,7 +204,6 @@ describe('Pool', () => {
       });
 
       const options = Object.assign({
-        autoStart: false,
         idlesAfter: 500,
         min: 5,
         ping,
@@ -226,14 +213,14 @@ describe('Pool', () => {
       const pool = new Pool(options);
 
       return pool.open()
-        .then(() => wait(600))
+        .then(() => delay(600))
         .then(() => {
           return pool.acquire().then(resource => pool.release(resource));
         })
-        .then(() => wait(500))
+        .then(() => delay(500))
         .then(() => {
           assert.strictEqual(ping.callCount, 4);
-          return wait(1000);
+          return delay(1000);
         })
         .then(() => {
           assert.strictEqual(ping.callCount, 9);
@@ -242,7 +229,3 @@ describe('Pool', () => {
     });
   });
 });
-
-function wait(duration) {
-  return new Promise(resolve => setTimeout(resolve, duration));
-}

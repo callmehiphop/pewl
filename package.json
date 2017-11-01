@@ -10,11 +10,13 @@
   "author": "Dave Gramlich <callmehiphop@gmail.com>",
   "license": "ISC",
   "devDependencies": {
+    "delay": "^2.0.0",
     "mocha": "^4.0.1",
     "prettier": "^1.7.4",
     "spyny": "^0.2.0"
   },
   "dependencies": {
+    "arrify": "^1.0.1",
     "p-queue": "^2.2.0"
   }
 }
