@@ -1,13 +1,9 @@
-'use strict';
-
-const assert = require('assert');
-const delay = require('delay');
-const spyny = require('spyny').sandbox();
-
-const spy = spyny.spy;
-
-const Cluster = require('../lib/cluster');
-const Pool = require('../lib/pool');
+import delay from 'delay';
+import inRange from 'in-range';
+import spyny from 'spyny';
+import test from 'ava';
+import timeSpan from 'time-span';
+import Pool, {Cluster} from '../';
 
 class FakeResource {
   create() {
@@ -18,190 +14,461 @@ class FakeResource {
   }
 }
 
-class ReadOnlyFakeResource extends FakeResource {}
-class ReadWriteFakeResource extends FakeResource {}
+class ReadOnlyResource extends FakeResource {}
+class ReadWriteResource extends FakeResource {}
 
-describe('Cluster', () => {
-  const readPool = new Pool({
-    min: 6,
-    attributes: ['read'],
-    create: () => new ReadOnlyFakeResource().create(),
-    destroy: resource => resource.destroy()
+async function createCluster(options = {}) {
+  const readOnlyPool = createPool({
+    attributes: ['r'],
+    create: () => new ReadOnlyResource().create(),
   });
 
-  const readWritePool = new Pool({
-    min: 4,
-    attributes: ['read', 'write'],
-    create: () => new ReadWriteFakeResource().create(),
-    destroy: resource => resource.destroy()
+  const readWritePool = createPool({
+    attributes: ['r', 'w'],
+    create: () => new ReadWriteResource().create(),
   });
+
+  const cluster = new Cluster(
+    Object.assign(
+      {
+        pools: [readOnlyPool, readWritePool],
+      },
+      options
+    )
+  );
+
+  if (options.open !== false) {
+    await cluster.open();
+  }
+
+  return {
+    readOnlyPool,
+    readWritePool,
+    cluster,
+  };
+}
+
+function createPool(options = {}) {
+  return new Pool(
+    Object.assign(
+      {
+        create: () => new FakeResource().create(),
+        destroy: resource => resource.destroy(),
+      },
+      options
+    )
+  );
+}
+
+function isAround(actual, around) {
+  return inRange(actual, around - 10, around + 50);
+}
+
+test('acquire()', async t => {
+  t.plan(4);
+
+  const {cluster} = await createCluster();
+  const resource = await cluster.acquire();
+
+  t.true(resource instanceof ReadOnlyResource);
+  t.is(cluster.size, 1);
+  t.is(cluster.available, 0);
+  t.is(cluster.borrowed, 1);
+});
+
+test('acquire() - by attributes', async t => {
+  t.plan(1);
+
+  const {cluster} = await createCluster();
+  const resource = await cluster.acquire({attributes: ['w']});
+
+  t.true(resource instanceof ReadWriteResource);
+});
+
+test('acquire() - no available resources', async t => {
+  t.plan(2);
+
+  const {readOnlyPool, readWritePool, cluster} = await createCluster();
+  const resource = await cluster.acquire();
+
+  readOnlyPool.set('max', readOnlyPool.size);
+  readWritePool.set('max', readWritePool.size);
+
+  setTimeout(() => cluster.release(resource), 500);
+
+  const end = timeSpan();
+  const nextResource = await cluster.acquire();
+
+  t.is(nextResource, resource);
+  t.true(isAround(end(), 500));
+});
+
+test('acquire() - timeout error', async t => {
+  t.plan(3);
+
+  const {readOnlyPool, readWritePool, cluster} = await createCluster({
+    acquireTimeout: 500,
+  });
+
+  readOnlyPool.set('max', 0);
+  readWritePool.set('max', 0);
+
+  const end = timeSpan();
+  const error = await t.throws(cluster.acquire());
+
+  t.is(error.message, 'No resources available.');
+  t.true(isAround(end(), 500));
+});
+
+test('acquire() - closed error', async t => {
+  t.plan(2);
+
+  const {cluster} = await createCluster();
+  await cluster.close();
+
+  const error = t.throws(() => cluster.acquire());
+
+  t.is(error.message, 'The pool has been closed.');
+});
+
+test('acquire() - async closed error', async t => {
+  t.plan(3);
+
+  const {readOnlyPool, readWritePool, cluster} = await createCluster();
+
+  readOnlyPool.set('max', 0);
+  readWritePool.set('max', 0);
+
+  setTimeout(() => cluster.close(), 500);
+
+  const end = timeSpan();
+  const error = await t.throws(cluster.acquire());
+
+  t.is(error.message, 'The pool has been closed.');
+  t.true(isAround(end(), 500));
+});
+
+test('acquire() - create error', async t => {
+  t.plan(2);
+
+  const createError = new Error('ohnoes');
+  const {readOnlyPool, cluster} = await createCluster();
+
+  readOnlyPool.set('create', () => Promise.reject(createError));
+  const error = await t.throws(cluster.acquire());
+
+  t.is(error, createError);
+});
+
+test('acquire() - bad attributes', async t => {
+  t.plan(2);
+
+  const {cluster} = await createCluster();
+  const error = await t.throws(cluster.acquire({attributes: ['nope']}));
+
+  t.is(error.message, 'No pools found with attribute(s) "nope".');
+});
+
+test('acquire() - empty cluster', async t => {
+  t.plan(2);
+
+  const cluster = new Cluster();
+  await cluster.open();
+
+  const error = await t.throws(cluster.acquire());
+
+  t.is(error.message, 'No pools found in cluster.');
+});
+
+test('add()', async t => {
+  t.plan(1);
+
+  const cluster = new Cluster();
+  const pool = createPool();
+
+  cluster.add(pool);
+
+  t.true(cluster.pools.indexOf(pool) > -1);
+});
+
+test('add() - shared options', async t => {
+  const clusterOptions = {
+    acquireTimeout: 20000,
+    diesAfter: 60000,
+    fifo: false,
+    idlesAfter: 30000,
+    ping: () => Promise.resolve(),
+    isDead: () => false,
+    isIdle: () => true,
+  };
+
+  t.plan(Object.keys(clusterOptions).length);
+
+  const cluster = new Cluster(clusterOptions);
+  const pool = createPool();
+
+  cluster.add(pool);
+
+  for (let option in clusterOptions) {
+    let poolValue = pool.get(option);
+    let clusterValue = cluster.get(option);
+
+    t.is(poolValue, clusterValue);
+  }
+});
+
+test('add() - proxying events', async t => {
+  const events = [
+    'available',
+    'createError',
+    'destroyed',
+    'destroyError',
+    'pingError',
+  ];
+
+  t.plan(events.length);
+
+  const cluster = new Cluster();
+  const pool = createPool();
+
+  cluster.add(pool);
+
+  events.forEach(event => {
+    cluster.on(event, (...args) => {
+      t.deepEqual(args, ['a', 'b', 'c']);
+    });
+
+    pool.emit(event, 'a', 'b', 'c');
+  });
+});
+
+test('close()', async t => {
+  t.plan(4);
 
   const cluster = new Cluster({
-    pools: [readPool, readWritePool]
+    pools: [createPool({min: 4}), createPool({min: 6})],
   });
 
-  before(() => cluster.open());
-  beforeEach(() => spyny.restore());
-  after(() => cluster.close());
-
-  describe('instantiating', () => {
-    it('should give status about the cluster', () => {
-      const stats = cluster.stats();
-
-      assert.strictEqual(stats.size, 10);
-      assert.strictEqual(stats.available, 10);
-      assert.strictEqual(stats.borrowed, 0);
-
-      const readOnlyStats = cluster.stats('read');
-
-      assert.strictEqual(readOnlyStats.size, 10);
-      assert.strictEqual(readOnlyStats.available, 10);
-      assert.strictEqual(readOnlyStats.borrowed, 0);
-
-      const readWriteStats = cluster.stats('write');
-
-      assert.strictEqual(readWriteStats.size, 4);
-      assert.strictEqual(readWriteStats.available, 4);
-      assert.strictEqual(readWriteStats.borrowed, 0);
-    });
+  const spies = cluster.pools.map(pool => {
+    return spyny.on(pool, 'close').passthrough();
   });
 
-  describe('acquiring resources', () => {
-    it('should acquire a resource', () => {
-      return cluster.acquire().then(resource => {
-        const stats = cluster.stats();
+  await cluster.open();
+  t.is(cluster.size, 10);
 
-        assert(resource instanceof FakeResource);
-        assert.strictEqual(stats.available, 9);
-        assert.strictEqual(stats.borrowed, 1);
+  await cluster.close();
+  t.is(cluster.size, 0);
 
-        cluster.release(resource);
-      });
-    });
+  spies.forEach(spy => {
+    t.is(spy.callCount, 1);
+  });
+});
 
-    it('should accept attributes when acquiring', () => {
-      return cluster.acquire({ attributes: 'write' }).then(resource => {
-        const stats = cluster.stats();
-        const writeStats = cluster.stats('write');
+test('close() - clears queue', async t => {
+  t.plan(2);
 
-        assert(resource instanceof ReadWriteFakeResource);
-        assert.strictEqual(stats.available, 9);
-        assert.strictEqual(stats.borrowed, 1);
-        assert.strictEqual(writeStats.available, 3);
-        assert.strictEqual(writeStats.borrowed, 1);
+  const poolOptions = {
+    min: 5,
+    create: () => delay(100).then(() => new FakeResource().create()),
+  };
 
-        cluster.release(resource);
-      });
-    });
+  const cluster = new Cluster({
+    pools: [createPool(poolOptions), createPool(poolOptions)],
   });
 
-  describe('releasing resources', () => {
-    it('should throw an error for unknown resources', () => {
-      assert.throws(() => {
-        cluster.release({});
-      }, /Unable to release unknown resource\./);
-    });
+  const end = timeSpan();
 
-    it('should release a resource to the correct pool', () => {
-      return cluster.acquire({ attributes: 'write' }).then(resource => {
-        const stats = cluster.stats();
+  cluster.open();
+  await cluster.close();
 
-        assert.strictEqual(stats.borrowed, 1);
-        assert.strictEqual(readWritePool.borrowed, 1);
+  t.true(isAround(end(), 100));
+  t.is(cluster.size, 0);
+});
 
-        cluster.release(resource);
+test('destroy()', async t => {
+  t.plan(3);
 
-        assert.strictEqual(stats.borrowed, 0);
-        assert.strictEqual(readWritePool.borrowed, 0);
-      });
-    });
+  const {cluster} = await createCluster();
+  const resource = await cluster.acquire();
+
+  spyny.on(resource, 'destroy').passthrough();
+
+  t.true(cluster.includes(resource));
+  await cluster.destroy(resource);
+  t.false(cluster.includes(resource));
+  t.is(resource.destroy.callCount, 1);
+});
+
+test('destroy() - unknown', async t => {
+  t.plan(2);
+
+  const {cluster} = await createCluster();
+  const error = t.throws(() => cluster.destroy({}));
+
+  t.is(error.message, 'Unable to destroy unknown resource.');
+});
+
+test('includes()', async t => {
+  t.plan(1);
+
+  const {cluster} = await createCluster();
+  const resource = await cluster.acquire();
+
+  t.true(cluster.includes(resource));
+});
+
+test('includes() - unknown', async t => {
+  t.plan(1);
+
+  const {cluster} = await createCluster();
+
+  t.false(cluster.includes({}));
+});
+
+test('open()', async t => {
+  t.plan(4);
+
+  const cluster = new Cluster({
+    pools: [createPool({min: 4}), createPool({min: 6})],
   });
 
-  describe('destroying resources', () => {
-    it('should throw an error for unknown resources', () => {
-      assert.throws(() => {
-        cluster.destroy({});
-      }, /Unable to destroy unknown resource\./);
-    });
-
-    it('should destroy resources', () => {
-      let cachedResource;
-      let stub;
-
-      return cluster.acquire().then(resource => {
-        assert(readPool.includes(resource));
-
-        cachedResource = resource;
-        stub = spy.on(resource, 'destroy').passthrough();
-
-        return cluster.destroy(resource);
-      }).then(() => {
-        assert.strictEqual(stub.called, true);
-        assert.strictEqual(readPool.includes(cachedResource), false);
-      });
-    });
+  const spies = cluster.pools.map(pool => {
+    return spyny.on(pool, 'open').passthrough();
   });
 
-  describe('skimming resources', () => {
-    it('should destroy expired resources', () => {
-      const stub = spy.on(FakeResource.prototype, 'destroy').passthrough();
-      const cluster = new Cluster({
-        diesAfter: 1000,
-        skimInterval: 1500,
-        pools: [createGenericPool(), createGenericPool()]
-      });
+  t.is(cluster.size, 0);
+  await cluster.open();
+  t.is(cluster.size, 10);
 
-      return cluster.open()
-        .then(() => delay(2000))
-        .then(() => {
-          assert.strictEqual(stub.callCount, 10);
-          return cluster.close();
-        })
-    });
+  spies.forEach(spy => {
+    t.is(spy.callCount, 1);
+  });
+});
+
+test('open() - open pools', async t => {
+  t.plan(5);
+
+  const openPool = createPool();
+  const closedPool = createPool();
+
+  const cluster = new Cluster({
+    pools: [openPool, closedPool],
   });
 
-  describe('pinging resources', () => {
-    it('should ping the resources', () => {
-      const ping = spy(resource => {
-        assert(resource instanceof FakeResource);
-        return Promise.resolve();
-      });
+  await openPool.open();
 
-      const pools = [createGenericPool(), createGenericPool()];
+  spyny.on(openPool, 'open').passthrough();
+  spyny.on(closedPool, 'open').passthrough();
 
-      const cluster = new Cluster({
-        idlesAfter: 500,
-        pingInterval: 1000,
-        pools,
-        ping
-      });
+  await cluster.open();
 
-      return cluster.open()
-        .then(() => delay(600))
-        .then(() => {
-          return Promise.all(
-            pools.map(pool => {
-              return pool.acquire().then(resource => pool.release(resource));
-            })
-          );
-        })
-        .then(() => delay(500))
-        .then(() => {
-          assert.strictEqual(ping.callCount, 8);
-          return delay(1000);
-        })
-        .then(() => {
-          assert.strictEqual(ping.callCount, 18);
-          return cluster.close();
-        });
-    });
-  });
+  t.true(cluster.isOpen);
+  t.true(openPool.isOpen);
+  t.is(openPool.open.callCount, 0);
+  t.true(closedPool.isOpen);
+  t.is(closedPool.open.callCount, 1);
+});
 
-  function createGenericPool() {
-    return new Pool({
-      min: 5,
-      create: () => new FakeResource().create(),
-      destroy: resource => resource.destroy()
-    });
-  }
+test('release()', async t => {
+  t.plan(4);
+
+  const {cluster} = await createCluster();
+  const resource = await cluster.acquire();
+
+  t.is(cluster.available, 0);
+  t.is(cluster.borrowed, 1);
+
+  cluster.release(resource);
+
+  t.is(cluster.available, 1);
+  t.is(cluster.borrowed, 0);
+});
+
+test('release() - unknown', async t => {
+  t.plan(2);
+
+  const {cluster} = await createCluster();
+  const error = t.throws(() => cluster.release({}));
+
+  t.is(error.message, 'Unable to release unknown resource.');
+});
+
+test('stats()', async t => {
+  t.plan(3);
+
+  const {cluster} = await createCluster();
+
+  await Promise.all(
+    cluster.pools.map(pool => {
+      return pool.set('min', 5).fill();
+    })
+  );
+
+  const stats = cluster.stats();
+
+  t.is(stats.available, 10);
+  t.is(stats.borrowed, 0);
+  t.is(stats.size, 10);
+});
+
+test('stats() - with borrowed resources', async t => {
+  t.plan(9);
+
+  const {cluster} = await createCluster();
+  const stats = cluster.stats();
+
+  const readResource = await cluster.acquire();
+  const writeResource = await cluster.acquire({attributes: ['w']});
+
+  t.is(stats.available, 0);
+  t.is(stats.borrowed, 2);
+  t.is(stats.size, 2);
+
+  cluster.release(readResource);
+
+  t.is(stats.available, 1);
+  t.is(stats.borrowed, 1);
+  t.is(stats.size, 2);
+
+  cluster.release(writeResource);
+
+  t.is(stats.available, 2);
+  t.is(stats.borrowed, 0);
+  t.is(stats.size, 2);
+});
+
+test('stats() - idle resources', async t => {
+  t.plan(3);
+
+  const {cluster} = await createCluster({idlesAfter: 1000});
+  const stats = cluster.stats();
+
+  await Promise.all(
+    cluster.pools.map(pool => {
+      return pool.set('min', 5).fill();
+    })
+  );
+
+  t.is(stats.idle, 0);
+  await delay(1000);
+  t.is(stats.idle, 10);
+
+  const resource = await cluster.acquire();
+  t.is(stats.idle, 9);
+});
+
+test('stats() - by attributes', async t => {
+  t.plan(2);
+
+  const {cluster} = await createCluster({idlesAfter: 1000});
+  const stats = cluster.stats(['w']);
+
+  await Promise.all(
+    cluster.pools.map(pool => {
+      return pool.set('min', 5).fill();
+    })
+  );
+
+  t.is(cluster.size, 10);
+  t.is(stats.size, 5);
 });

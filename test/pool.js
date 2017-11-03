@@ -1,12 +1,9 @@
-'use strict';
-
-const assert = require('assert');
-const delay = require('delay');
-const spyny = require('spyny').sandbox();
-
-const spy = spyny.spy;
-
-const Pool = require('../lib/pool');
+import delay from 'delay';
+import inRange from 'in-range';
+import spyny from 'spyny';
+import test from 'ava';
+import timeSpan from 'time-span';
+import Pool from '../';
 
 class FakeResource {
   create() {
@@ -17,215 +14,378 @@ class FakeResource {
   }
 }
 
-describe('Pool', () => {
-  const defaultOptions = {
-    create: () => new FakeResource().create(),
-    destroy: resource => resource.destroy()
-  };
+async function createPool(options = {}) {
+  const pool = new Pool(
+    Object.assign(
+      {
+        create: () => new FakeResource().create(),
+        destroy: resource => resource.destroy(),
+      },
+      options
+    )
+  );
 
-  let pool;
+  if (options.open !== false) {
+    await pool.open();
+  }
 
-  beforeEach(() => {
-    spyny.restore();
-    pool = new Pool(defaultOptions);
+  return pool;
+}
 
-    return pool.open();
+function isAround(actual, around) {
+  return inRange(actual, around - 10, around + 50);
+}
+
+test('acquire()', async t => {
+  t.plan(4);
+
+  const pool = await createPool();
+  const resource = await pool.acquire();
+
+  t.true(resource instanceof FakeResource);
+  t.is(pool.size, 1);
+  t.is(pool.available, 0);
+  t.is(pool.borrowed, 1);
+});
+
+test('acquire() - no available resources', async t => {
+  t.plan(2);
+
+  const pool = await createPool({max: 1});
+  const resource = await pool.acquire();
+
+  setTimeout(() => pool.release(resource), 500);
+
+  const end = timeSpan();
+  const nextResource = await pool.acquire();
+
+  t.is(nextResource, resource);
+  t.true(isAround(end(), 500));
+});
+
+test('acquire() - timeout error', async t => {
+  t.plan(3);
+
+  const pool = await createPool({acquireTimeout: 500, max: 0});
+  const end = timeSpan();
+  const error = await t.throws(pool.acquire());
+
+  t.is(error.message, 'No resources available.');
+  t.true(isAround(end(), 500));
+});
+
+test('acquire() - closed error', async t => {
+  t.plan(2);
+
+  const pool = await createPool();
+  await pool.close();
+
+  const error = t.throws(() => pool.acquire());
+
+  t.is(error.message, 'The pool has been closed.');
+});
+
+test('acquire() - async closed error', async t => {
+  t.plan(3);
+
+  const pool = await createPool({max: 0});
+
+  setTimeout(() => pool.close(), 500);
+
+  const end = timeSpan();
+  const error = await t.throws(pool.acquire());
+
+  t.is(error.message, 'The pool has been closed.');
+  t.true(isAround(end(), 500));
+});
+
+test('acquire() - create error', async t => {
+  t.plan(2);
+
+  const createError = new Error('ohnoes');
+  const pool = await createPool({
+    create: () => Promise.reject(createError),
+  });
+  const error = await t.throws(pool.acquire());
+
+  t.is(error, createError);
+});
+
+test('close()', async t => {
+  t.plan(6);
+
+  const pool = await createPool({min: 5});
+
+  t.true(pool.isOpen);
+  t.is(pool.size, 5);
+  t.is(pool.available, 5);
+
+  await pool.close();
+
+  t.false(pool.isOpen);
+  t.is(pool.size, 0);
+  t.is(pool.available, 0);
+});
+
+test('close() - clears queue', async t => {
+  t.plan(2);
+
+  const pool = await createPool({
+    create: () => delay(100).then(() => new FakeResource().create()),
   });
 
-  afterEach(() => pool.close());
+  const end = timeSpan();
 
-  describe('instantiating', () => {
-    it('should fill the pool to the min value', () => {
-      const stub = spy.on(FakeResource.prototype, 'create').passthrough();
-      const min = 5;
+  pool.set('min', 5).fill();
+  await pool.close();
 
-      const options = Object.assign({ min }, defaultOptions);
-      const pool = new Pool(options);
+  t.true(isAround(end(), 100));
+  t.is(pool.size, 0);
+});
 
-      return pool.open().then(() => {
-        assert.strictEqual(pool.size, min);
-        assert.strictEqual(stub.callCount, min);
+test('destroy()', async t => {
+  t.plan(3);
 
-        return pool.close();
-      });
-    });
+  const pool = await createPool();
+  const resource = await pool.acquire();
+
+  spyny.on(resource, 'destroy').passthrough();
+
+  t.true(pool.includes(resource));
+  await pool.destroy(resource);
+  t.false(pool.includes(resource));
+  t.is(resource.destroy.callCount, 1);
+});
+
+test('destroy() - available', async t => {
+  t.plan(2);
+
+  const pool = await createPool();
+  const resource = await pool.acquire();
+
+  pool.release(resource);
+  t.true(pool.includes(resource));
+  pool.destroy(resource);
+  t.false(pool.includes(resource));
+});
+
+test('destroy() - unknown', async t => {
+  t.plan(2);
+
+  const pool = await createPool();
+  const error = t.throws(() => pool.destroy({}));
+
+  t.is(error.message, 'Unable to destroy unknown resource.');
+});
+
+test('destroy() - error', async t => {
+  t.plan(2);
+
+  const destroyErr = new Error('ohnoes');
+  const pool = await createPool({
+    destroy: () => Promise.reject(destroyErr),
+  });
+  const resource = await pool.acquire();
+  const end = timeSpan();
+
+  pool.on('destroyError', (err, rsrc) => {
+    t.is(err, destroyErr);
+    t.is(rsrc, resource);
   });
 
-  describe('acquiring resources', () => {
-    it('should create resources while under max threshold', () => {
-      const stub = spy.on(FakeResource.prototype, 'create').passthrough();
+  await pool.destroy(resource);
+});
 
-      assert.strictEqual(pool.size, 0);
+test('drain()', async t => {
+  t.plan(2);
 
-      return pool.acquire().then(resource => {
-        assert(resource instanceof FakeResource);
+  const pool = await createPool({min: 5});
 
-        assert.strictEqual(stub.called, true);
-        assert.strictEqual(pool.size, 1);
+  t.is(pool.size, 5);
 
-        pool.release(resource);
-      });
-    });
+  await pool.drain();
 
-    it('should not create resources when there are available ones', () => {
-      let stub;
+  t.is(pool.size, 0);
+});
 
-      return pool
-        .set('min', 1)
-        .fill()
-        .then(() => {
-          assert.strictEqual(pool.size, 1);
-          stub = spy.on(FakeResource.prototype, 'create').passthrough();
-          return pool.acquire();
-        })
-        .then(resource => {
-          assert.strictEqual(stub.called, false);
-          assert.strictEqual(pool.size, 1);
+test('fill()', async t => {
+  t.plan(2);
 
-          pool.release(resource);
-        });
-    });
+  const pool = await createPool();
 
-    it('should not create a new resource if the max is hit', () => {
-      let cachedResource;
+  t.is(pool.size, 0);
+  pool.set('min', 5);
+  await pool.fill();
+  t.is(pool.size, 5);
+});
 
-      pool.set('max', 1);
+test('fill() - already filled', async t => {
+  t.plan(2);
 
-      pool.acquire().then(resource => {
-        cachedResource = resource;
-        setTimeout(() => pool.release(resource), 500);
-      });
+  const pool = await createPool({min: 5});
 
-      return pool.acquire().then(resource => {
-        assert.strictEqual(resource, cachedResource);
+  t.is(pool.size, 5);
+  await pool.fill();
+  t.is(pool.size, 5);
+});
 
-        pool.set('max', Infinity);
-        pool.release(resource);
-      });
-    });
+test('includes()', async t => {
+  t.plan(1);
+
+  const pool = await createPool();
+  const resource = await pool.acquire();
+
+  t.true(pool.includes(resource));
+});
+
+test('includes() - available', async t => {
+  t.plan(1);
+
+  const pool = await createPool();
+  const resource = await pool.acquire();
+
+  pool.release(resource);
+  t.true(pool.includes(resource));
+});
+
+test('includes() - unknown', async t => {
+  t.plan(1);
+
+  const pool = await createPool();
+  t.false(pool.includes({}));
+});
+
+test('open()', async t => {
+  t.plan(4);
+
+  const pool = await createPool({open: false, min: 5});
+
+  t.false(pool.isOpen);
+  t.is(pool.size, 0);
+
+  await pool.open();
+
+  t.true(pool.isOpen);
+  t.is(pool.size, 5);
+});
+
+test('release()', async t => {
+  t.plan(4);
+
+  const pool = await createPool();
+  const resource = await pool.acquire();
+
+  t.is(pool.borrowed, 1);
+  t.is(pool.available, 0);
+
+  pool.release(resource);
+
+  t.is(pool.borrowed, 0);
+  t.is(pool.available, 1);
+});
+
+test('release() - unknown', async t => {
+  t.plan(2);
+
+  const pool = await createPool();
+  const error = t.throws(() => pool.release({}));
+
+  t.is(error.message, 'Unable to release unknown resource.');
+});
+
+test('pinging resources', async t => {
+  t.plan(2);
+
+  const spy = spyny(() => Promise.resolve());
+  const pool = await createPool({
+    ping: spy,
+    min: 2,
+    pingInterval: 1000,
+    idlesAfter: 600,
   });
 
-  describe('releasing resources', () => {
-    it('should throw an error for unknown resources', () => {
-      assert.throws(() => {
-        pool.release({});
-      }, /Unable to release unknown resource\./);
-    });
+  await delay(500);
+  // check 1 out so its not considered idle
+  const resource = await pool.acquire();
+  pool.release(resource);
+  await delay(500);
 
-    it('should release resources back to the pool', () => {
-      return pool.acquire().then(resource => {
-        assert.strictEqual(pool.available, 0);
-        assert.strictEqual(pool.borrowed, 1);
+  t.is(spy.callCount, 1);
+  await delay(1000);
 
-        pool.release(resource);
+  t.is(spy.callCount, 3);
+  await pool.close();
+});
 
-        assert.strictEqual(pool.available, 1);
-        assert.strictEqual(pool.borrowed, 0);
-      });
-    });
+test('pinging resources - error', async t => {
+  t.plan(3);
+
+  const pingError = new Error('ohnoes');
+  const spy = spyny(() => Promise.reject(pingError));
+  const pool = await createPool({
+    ping: spy,
+    min: 1,
+    pingInterval: 500,
+    idlesAfter: 400,
   });
 
-  describe('destroying resources', () => {
-    it('should throw an error for unknown resources', () => {
-      assert.throws(() => {
-        pool.destroy({});
-      }, /Unable to destroy unknown resource\./);
-    });
-
-    it('should destroy resources', () => {
-      let stub;
-
-      return pool.acquire().then(resource => {
-        assert.strictEqual(pool.size, 1);
-        stub = spy.on(resource, 'destroy').passthrough();
-
-        return pool.destroy(resource);
-      }).then(() => {
-        assert.strictEqual(pool.size, 0);
-        assert.strictEqual(stub.called, true);
-      });
-    });
+  pool.on('pingError', (err, resource) => {
+    t.is(err, pingError);
+    t.true(resource instanceof FakeResource);
+    t.false(pool.includes(resource));
   });
 
-  describe('skimming resources', () => {
-    it('should destroy expired resources', () => {
-      const stub = spy.on(FakeResource.prototype, 'destroy').passthrough();
-      const options = Object.assign({
-        diesAfter: 1000,
-        min: 5,
-        skimInterval: 1500
-      }, defaultOptions);
+  await delay(550);
+  await pool.close();
+});
 
-      const pool = new Pool(options);
+test('skimming resources - dead', async t => {
+  t.plan(4);
 
-      return pool.open()
-        .then(() => delay(2000))
-        .then(() => {
-          assert.strictEqual(stub.callCount, 5);
-          return pool.close();
-        });
-    });
-
-    it('should respect the maxIdle option', () => {
-      const stub = spy.on(FakeResource.prototype, 'destroy').passthrough();
-      const options = Object.assign({
-        idlesAfter: 1000,
-        maxIdle: 1,
-        min: 5,
-        skimInterval: 1500
-      }, defaultOptions);
-
-      const pool = new Pool(options);
-
-      return pool.open()
-        .then(() => {
-          pool.set('min', 0)
-          return delay(1100);
-        })
-        .then(() => {
-          assert.strictEqual(pool.size, 5);
-          assert.strictEqual(pool.idle, 5);
-          return delay(900);
-        })
-        .then(() => {
-          assert.strictEqual(stub.callCount, 4);
-          assert.strictEqual(pool.size, 1);
-          assert.strictEqual(pool.idle, 1);
-          return pool.close();
-        });
-    });
+  const spy = spyny(() => Promise.resolve());
+  const pool = await createPool({
+    min: 5,
+    skimInterval: 500,
+    diesAfter: 400,
+    destroy: spy,
   });
 
-  describe('pinging resources', () => {
-    it('should ping the resources', () => {
-      const ping = spy(resource => {
-        assert(resource instanceof FakeResource);
-        return Promise.resolve();
-      });
+  await delay(600);
+  t.is(spy.callCount, 5);
+  t.is(pool.size, 5);
 
-      const options = Object.assign({
-        idlesAfter: 500,
-        min: 5,
-        ping,
-        pingInterval: 1000
-      }, defaultOptions);
+  await delay(600);
+  t.is(spy.callCount, 10);
+  t.is(pool.size, 5);
 
-      const pool = new Pool(options);
+  await pool.close();
+});
 
-      return pool.open()
-        .then(() => delay(600))
-        .then(() => {
-          return pool.acquire().then(resource => pool.release(resource));
-        })
-        .then(() => delay(500))
-        .then(() => {
-          assert.strictEqual(ping.callCount, 4);
-          return delay(1000);
-        })
-        .then(() => {
-          assert.strictEqual(ping.callCount, 9);
-          return pool.close();
-        });
-    });
+test('skimming resources - idle', async t => {
+  t.plan(6);
+
+  const spy = spyny(() => Promise.resolve());
+  const pool = await createPool({
+    min: 10,
+    maxIdle: 0,
+    skimInterval: 500,
+    idlesAfter: 400,
+    destroy: spy,
   });
+
+  pool.set('min', 5);
+  await delay(600);
+  t.is(spy.callCount, 5);
+  t.is(pool.size, 5);
+
+  await delay(600);
+  t.is(spy.callCount, 5);
+  t.is(pool.size, 5);
+
+  pool.set('min', 0);
+  await delay(600);
+  t.is(spy.callCount, 10);
+  t.is(pool.size, 0);
+
+  await pool.close();
 });
