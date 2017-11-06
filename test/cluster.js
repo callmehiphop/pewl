@@ -111,6 +111,31 @@ test('acquire() - no available resources', async t => {
   t.true(isAround(end(), 500));
 });
 
+test('acquire() - non-racing queue', async t => {
+  t.plan(3);
+
+  const {cluster} = await createCluster();
+  const resources = [await cluster.acquire(), await cluster.acquire()];
+
+  cluster.pools.forEach(pool => pool.set('max', pool.size));
+
+  setTimeout(() => {
+    resources.forEach(resource => cluster.release(resource));
+  }, 500);
+
+  const end = timeSpan();
+  const nextResources = await Promise.all([
+    cluster.acquire(),
+    cluster.acquire(),
+  ]);
+
+  // because we treat the pool like a stack, the most recently used resource
+  // will be returned first.
+  t.is(resources[0], nextResources[1]);
+  t.is(resources[1], nextResources[0]);
+  t.true(isAround(end(), 500));
+});
+
 test('acquire() - timeout error', async t => {
   t.plan(3);
 
@@ -173,7 +198,9 @@ test('acquire() - bad attributes', async t => {
   t.plan(2);
 
   const {cluster} = await createCluster();
-  const error = await t.throws(cluster.acquire({attributes: ['nope']}));
+  const error = t.throws(() => {
+    cluster.acquire({attributes: ['nope']});
+  });
 
   t.is(error.message, 'No pools found with attribute(s) "nope".');
 });
@@ -184,7 +211,7 @@ test('acquire() - empty cluster', async t => {
   const cluster = new Cluster();
   await cluster.open();
 
-  const error = await t.throws(cluster.acquire());
+  const error = t.throws(() => cluster.acquire());
 
   t.is(error.message, 'No pools found in cluster.');
 });
