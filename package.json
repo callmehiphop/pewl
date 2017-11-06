@@ -4,15 +4,15 @@
   "description": "Generic Pooling Library",
   "main": "index.js",
   "scripts": {
-    "cover": "nyc npm run test",
     "lint": "eslint index.js lib/*.js",
     "prettier": "prettier --write *.js lib/*.js test/*.js",
-    "test": "ava test/*.js --verbose --timeout=10s"
+    "test": "nyc --reporter=lcov ava test/*.js --verbose --timeout=10s && nyc report"
   },
   "author": "Dave Gramlich <callmehiphop@gmail.com>",
   "license": "ISC",
   "devDependencies": {
     "ava": "^0.23.0",
+    "codecov": "^3.0.0",
     "eslint": "^4.10.0",
     "eslint-config-google": "^0.9.1",
     "in-range": "^1.0.0",
