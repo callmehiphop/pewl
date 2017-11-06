@@ -12,7 +12,7 @@ install_and_test: &install_and_test
     - run:
         name: Test
         command: npm test
-      - run:
+    - run:
         name: Coverage
         command: node_modules/.bin/codecov
         when: always
