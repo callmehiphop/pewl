@@ -36,6 +36,40 @@ function isAround(actual, around) {
   return inRange(actual, around - 10, around + 50);
 }
 
+test('instantiating - no options', t => {
+  t.plan(2);
+
+  const error = t.throws(() => new Pool());
+
+  t.is(error.message, 'Both "create" and "destroy" methods are required.');
+});
+
+test('instantiating - no destroy', t => {
+  t.plan(2);
+
+  const error = t.throws(
+    () =>
+      new Pool({
+        create: () => {},
+      })
+  );
+
+  t.is(error.message, 'Both "create" and "destroy" methods are required.');
+});
+
+test('instantiating - no create', t => {
+  t.plan(2);
+
+  const error = t.throws(
+    () =>
+      new Pool({
+        destroy: () => {},
+      })
+  );
+
+  t.is(error.message, 'Both "create" and "destroy" methods are required.');
+});
+
 test('acquire()', async t => {
   t.plan(4);
 
@@ -293,6 +327,19 @@ test('release() - unknown', async t => {
   t.is(error.message, 'Unable to release unknown resource.');
 });
 
+test('autostarting', async t => {
+  t.plan(1);
+
+  const pool = new Pool({
+    autoStart: true,
+    create: () => new FakeResource().create(),
+    destroy: resource => resource.destroy(),
+  });
+
+  await delay(100);
+  t.true(pool.isOpen);
+});
+
 test('pinging resources', async t => {
   t.plan(2);
 
@@ -385,6 +432,28 @@ test('skimming resources - idle', async t => {
   pool.set('min', 0);
   await delay(600);
   t.is(spy.callCount, 10);
+  t.is(pool.size, 0);
+
+  await pool.close();
+});
+
+test('skimming resources - idle and dead', async t => {
+  t.plan(2);
+
+  const spy = spyny(() => Promise.resolve());
+  const pool = await createPool({
+    min: 5,
+    maxIdle: 0,
+    skimInterval: 500,
+    idlesAfter: 400,
+    diesAfter: 400,
+    destroy: spy,
+  });
+
+  pool.set('min', 0);
+  await delay(600);
+
+  t.is(spy.callCount, 5);
   t.is(pool.size, 0);
 
   await pool.close();
