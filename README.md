@@ -1,4 +1,4 @@
-# Pewl [![CircleCI](https://img.shields.io/circleci/project/github/callmehiphop/pewl.svg?style=flat)](https://circleci.com/gh/callmehiphop/pewl)
+# Pewl [![CircleCI](https://img.shields.io/circleci/project/github/callmehiphop/pewl.svg?style=flat)](https://circleci.com/gh/callmehiphop/pewl) [![codecov](https://img.shields.io/codecov/c/github/callmehiphop/pewl/master.svg?style=flat)](https://codecov.io/gh/callmehiphop/pewl)
 
 > Generic pooling library
 
